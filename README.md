@@ -8,28 +8,79 @@ One script, no dependencies beyond what you already need to build `ds4`.
 
 ## Why interleaved
 
-The obvious way to measure a branch is to run the baseline, then run the
-branch, and compare. That cannot separate a real change from machine drift.
-Thermal state, background load, and page-cache warmth all move between the two
-runs, and they move in one direction, so a slow baseline and a fast branch look
+The obvious way to measure a branch is to run the baseline, then the branch,
+and compare. That cannot separate a real change from machine drift. Thermal
+state, background load and page-cache warmth all move between the two runs,
+and they move in one direction, so a slow baseline and a fast branch look
 exactly like an improvement.
 
-This harness runs each arm twice, interleaved:
+Interleaving fixes this by making the arm variable orthogonal to time. If both
+arms have the same **mean position** in the session, a steady drift adds the
+same amount to each arm and cancels out. `ABBA` does this exactly: A runs at
+positions 1 and 4, B at 2 and 3, both averaging 2.5.
 
-```
-MBBM:  base, branch, branch, base
-BMMB:  branch, base, base, branch
-```
+Running each arm more than once also gives you a free error bar. The spread
+between an arm's own runs bounds how much of your measured delta could be
+noise, and the report prints it. A `+35%` with a `0.4%` spread and a `+2%`
+with a `0.4%` spread are very different claims.
 
-Each arm gets one run in each half of the session, so any monotonic drift lands
-on both arms alike instead of on one. The two runs of a single arm also give
-you a free error bar: the spread between them bounds how much of your measured
-delta could be noise. The report prints that spread and the worst case across
-the sweep, so a "+35%" with a 0.4% spread reads very differently from a "+2%"
-with the same spread.
+## Choosing an order
 
-Both are reported. If a delta is not comfortably larger than the spread, it is
-not a result.
+**Longer is not better. Balanced is better.** More runs shrink *random* noise,
+as `1/sqrt(n)`. Only a balanced order removes *systematic* drift, and drift is
+almost always the larger error. A badly shaped 8-run order is worse than
+`ABBA` while costing twice the machine time.
+
+The test is whether the arms match on the mean of their positions (cancels
+linear drift) and on the mean of their squared positions (cancels curvature,
+which is what thermal saturation looks like):
+
+| order | runs | linear | quadratic | verdict |
+|---|---:|---|---|---|
+| `ABBA` / `MBBM` | 4 | cancels | no | **the default; right for almost everything** |
+| `BAAB` / `BMMB` | 4 | cancels | no | same design, reversed; useful as a confirmation |
+| `ABBABAAB` (`tm8`) | 8 | cancels | cancels | **worth it for small effects or a drifty machine** |
+| Thue-Morse 16 (`tm16`) | 16 | cancels | cancels (+cubic) | overkill for this workload |
+| `ABBAAB` | 6 | **NO** | no | *worse than `ABBA`* and 50% more time |
+| `AABBBBAA` | 8 | cancels | no | linear-safe but maximally exposed to curvature |
+| `ABABABAB` | 8 | **NO** | no | alternating never balances; avoid |
+
+Two of those deserve comment, because they look reasonable and are not:
+
+- **`ABBAAB` (6 runs).** A's mean position is 3.33, B's is 3.67. It does not
+  even cancel linear drift, so it is a strictly worse design than the 4-run
+  default while costing 50% more machine time. Extending `ABBA` by tacking
+  runs on the end generally breaks it.
+- **`AABBBBAA` (8 runs, "2M4B2M").** Balanced on the mean, so linear drift
+  cancels. But every B run is clustered in the middle of the session and every
+  A run at the ends, so any curvature maps directly onto the arm difference —
+  and thermal saturation is exactly a curve that is steep early and flat
+  later. This is close to the worst realistic 8-run shape.
+
+The good 8-run order is the **Prouhet-Thue-Morse** sequence `ABBABAAB`
+(`--order tm8`), which balances both moments. That is not a coincidence:
+Prouhet's theorem is precisely the statement that this sequence splits
+`1..2^k` into two sets with equal power sums.
+
+### Practical advice
+
+Run `ABBA` first and read the repeatability line. Then:
+
+- **Spread much smaller than the effect** (the usual case for a real kernel
+  change: 0.3% spread, 30% effect) — you are done. More runs cannot make a
+  30% result more true, and `tm8` would only confirm it at twice the cost.
+- **Effect within a few multiples of the spread** — escalate to `--order tm8`.
+  This is where the extra runs genuinely buy something: 4 samples per arm
+  instead of 2, plus curvature cancellation.
+- **Effect comparable to the spread** — more runs will not save you. Fix the
+  machine instead: close everything else, let it settle, and if using SSD
+  streaming, warm the cache. Then re-measure.
+- **Sanity check a surprising result** by re-running with `--order bmmb`. A
+  real effect reproduces under the reversed order; an artefact of session
+  shape often does not.
+
+The report grades whatever order you pass and warns you if it is unbalanced,
+so you do not have to keep this table in your head.
 
 ## What it does
 
@@ -77,33 +128,47 @@ chmod +x ds4-interleaved-bench.sh
 ## Usage
 
 ```
-ds4-interleaved-bench.sh --repo PATH --branch NAME --model FILE [options]
+branch mode   ds4-interleaved-bench.sh --repo PATH --branch NAME --model FILE [options]
+model mode    ds4-interleaved-bench.sh --repo PATH --model FILE --model-b FILE [options]
 ```
+
+Branch mode compares two commits on one model. Model mode compares two model
+files on one commit. Passing `--model-b` selects model mode.
 
 ### Required
 
 | flag | meaning |
 |---|---|
 | `--repo PATH` | Path to the `ds4` git repository. |
-| `--branch NAME` | Branch, tag, or any commit-ish under test. |
-| `--model FILE` | GGUF model file. Relative paths resolve against `--repo`. |
+| `--model FILE` | GGUF model (arm A). Relative paths resolve against `--repo`. |
+| `--branch NAME` | *Branch mode:* branch, tag or commit-ish under test. |
+| `--model-b FILE` | *Model mode:* second GGUF model (arm B). |
 
 ### Options
 
 | flag | default | meaning |
 |---|---|---|
-| `--base-ref NAME` | `main` | Baseline to compare against. |
-| `--order MBBM\|BMMB` | `MBBM` | Interleave order. Case-insensitive. |
+| `--base-ref NAME` | `main` | Branch mode: baseline commit-ish. |
+| `--ref NAME` | `main` | Model mode: the single commit both arms run at. |
+| `--order SPEC` | `ABBA` | Interleave order. Preset or literal A/M and B string. |
 | `--prompt-file FILE` | `speed-bench/promessi_sposi.txt` | Benchmark text, relative to `--repo`. |
 | `--ctx-start N` | `2048` | First measured frontier. |
 | `--ctx-max N` | `16384` | Last measured frontier. |
 | `--step-mul F` | `2` | Multiplicative frontier step. |
 | `--gen-tokens N` | `128` | Greedy decode tokens per frontier. |
+| `--ssd-streaming` | off | Run both arms with `--ssd-streaming`. Implies `--warmup`. |
+| `--warmup` | off | One short discarded run per arm before the sequence. |
+| `--no-warmup` | — | Suppress the warmup that `--ssd-streaming` implies. |
+| `--label-a TEXT` | auto | Override arm A's column label. |
+| `--label-b TEXT` | auto | Override arm B's column label. |
 | `--out-dir DIR` | `$HOME/ds4-bench-results` | Where the report is written. |
 | `--cache-dir DIR` | `$HOME/.cache/ds4-bench` | Worktree and build cache. |
 | `--bench-arg ARG` | — | Extra argument passed through to `ds4-bench`. Repeatable. |
 | `--rebuild` | off | Rebuild even if a cached worktree binary exists. |
 | `--keep-going` | off | Do not abort the sweep if one run fails. |
+
+Order presets: `abba` / `mbbm` (4), `baab` / `bmmb` (4), `tm8` (8), `tm16` (16).
+Any literal string of `A`/`M` and `B` also works, e.g. `--order ABBABAAB`.
 
 The report path is printed on stdout; progress goes to stderr, so
 `REPORT=$(ds4-interleaved-bench.sh ...)` works.
@@ -140,17 +205,59 @@ A quick smoke run, and a comparison against something other than `main`:
     --base-ref v1.2.0 --model gguf/model.gguf
 ```
 
-Pass flags through to `ds4-bench`:
+Eight runs when the effect is small, and pass-through of any other
+`ds4-bench` flag:
 
 ```sh
 ./ds4-interleaved-bench.sh --repo ~/ds4 --branch my-branch \
-    --model gguf/model.gguf --bench-arg --ssd-streaming
+    --model gguf/model.gguf --order tm8
+
+./ds4-interleaved-bench.sh --repo ~/ds4 --branch my-branch \
+    --model gguf/model.gguf --bench-arg --prefill-chunk --bench-arg 8192
 ```
+
+## Comparing two models
+
+Pass `--model-b` to compare two model files on a single commit, holding the
+engine fixed. This is the right tool for asking which quantization is faster:
+
+```sh
+./ds4-interleaved-bench.sh \
+    --repo ~/ds4 \
+    --ref my-branch \
+    --model   gguf/GLM-5.3-Flash-Q2.gguf \
+    --model-b gguf/GLM-5.3-Flash-Q4_K-kdaHeadQ8.gguf
+```
+
+Both arms build and run from one worktree, so only the model file varies.
+Column labels are derived by stripping the shared leading part of the two file
+names, so the example above yields `Q2` and `Q4_K-kdaHeadQ8` rather than two
+near-identical long names. Override with `--label-a` / `--label-b`.
+
+`--ref` selects the commit; it defaults to `main`. Everything else — orders,
+the report, the repeatability check — behaves identically to branch mode.
+
+## SSD streaming
+
+`--ssd-streaming` runs both arms with the flag and records it in the report.
+(Any other `ds4-bench` flag can be passed through with `--bench-arg`.)
+
+Streaming reads weights from disk during decode, which makes the OS page cache
+part of what you are measuring. A cold first run is penalised, and that
+penalty does not cancel the way thermal drift does, because it hits run 1 only.
+So `--ssd-streaming` implies `--warmup`: one short discarded run per arm
+before the sequence, touching every layer. Use `--no-warmup` to opt out, and
+the report will note that run 1 was cold.
+
+Expect noisier numbers than a resident run — I/O variance is larger than GPU
+variance — so read the repeatability line before believing a small delta.
 
 ## The report
 
-Written to `$HOME/ds4-bench-results/ds4-bench-<branch>-<model>-<order>-<timestamp>.md`.
-The timestamp makes every run a new file, so nothing is overwritten and reports
+Written to `$HOME/ds4-bench-results/`, named
+`ds4-bench-<branch>-<model>-<order>-<timestamp>.md` in branch mode and
+`ds4-bench-models-<a>-vs-<b>-<order>-<timestamp>.md` in model mode. The
+timestamp makes every run a new file, so nothing is overwritten and reports
 sort chronologically.
 
 It contains:
@@ -161,29 +268,34 @@ It contains:
   exact `ds4-bench` command.
 - **Machine** — chip, model identifier, P/E core split, GPU cores, memory,
   macOS version and build, compiler version.
+- **Interleave design** — the order, and whether it cancels linear and
+  quadratic drift, with a warning if it does not.
 - **Results** — the table below, plus time to first token and repeatability.
 - **Run order** — every run with start, end, and exit code.
 - **Engine load** — the `ds4:` lines from the first run, so the model path and
   memory plan are on the record.
-- **Raw CSV** — all four, in collapsible blocks.
+- **Raw CSV** — one block per run, collapsible.
 
-The results table shows **both runs of each arm**, `first / second` in the
-order they ran, with deltas comparing the two-run means:
+The results table shows **every run of each arm**, in the order they ran,
+with deltas comparing the arms' means:
 
 | frontier | main prefill | branch prefill | prefill | main decode | branch decode | decode |
 |---:|---:|---:|---:|---:|---:|---:|
 | 2048 | 431.42 / 431.43 | 431.63 / 431.73 | +0.06% | 26.50 / 26.65 | 36.26 / 36.14 | **+36.22%** |
 | 4096 | 392.29 / 392.24 | 392.41 / 392.48 | +0.05% | 25.96 / 26.05 | 35.31 / 35.27 | **+35.70%** |
 
-Showing both runs rather than only the mean is deliberate: it lets a reader
-audit the claim without opening the CSVs. Two tight pairs and a large gap
-between them is a result. Two loose pairs is not.
+Showing the individual runs rather than only the mean is deliberate: it lets
+a reader audit the claim without opening the CSVs. Two tight groups with a
+large gap between them is a result. Two loose groups is not.
+
+In model mode the column headers are the two model labels instead of
+`main` / `branch`.
 
 Followed by the repeatability check:
 
 ```
-Worst spread between an arm's own two runs: 0.56% (main gen_tps at ctx 2048).
-A measured delta is only meaningful well above this.
+Worst spread within a single arm's own runs: 0.56% (main gen_tps at ctx 2048).
+A delta is only meaningful well above this.
 ```
 
 Decode is `gen_tps`, throughput over the full generation at each frontier.
@@ -217,6 +329,10 @@ git -C ~/ds4 worktree prune
 - **A speed result is not a correctness result.** This measures throughput and
   nothing else. If a change touches numerics, verify it separately — for
   greedy decode, byte-compare generations between the two builds.
+- **Model mode compares speed only.** A quantization that decodes faster is
+  not thereby better; it is usually faster because it is smaller, which is a
+  quality decision this tool knows nothing about. Pair it with a quality
+  measurement before drawing a conclusion.
 
 ## Exit codes
 
