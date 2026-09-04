@@ -202,13 +202,23 @@ if [ -z "$LABEL_A" ] || [ -z "$LABEL_B" ]; then
         while [ $i -lt ${#ba} ] && [ $i -lt ${#bb} ] && [ "${ba:$i:1}" = "${bb:$i:1}" ]; do
             i=$((i + 1))
         done
-        # Back up to a separator so a token is never cut in half.
+        # Back up to a separator so a token is never cut in half.  Prefer a
+        # dash or dot; an underscore only if there is nothing else, since
+        # quant names like Q4_K contain one.
         cut=$i
         while [ $cut -gt 0 ]; do
             prev=$((cut - 1)); ch=${ba:$prev:1}
-            case "$ch" in -|_|.) break ;; esac
+            case "$ch" in -|.) break ;; esac
             cut=$prev
         done
+        if [ $cut -eq 0 ]; then
+            cut=$i
+            while [ $cut -gt 0 ]; do
+                prev=$((cut - 1)); ch=${ba:$prev:1}
+                case "$ch" in -|_|.) break ;; esac
+                cut=$prev
+            done
+        fi
         auto_a=${ba:$cut}; auto_b=${bb:$cut}
         [ -n "$auto_a" ] || auto_a=$ba
         [ -n "$auto_b" ] || auto_b=$bb
