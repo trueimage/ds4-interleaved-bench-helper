@@ -260,6 +260,12 @@ Written to `$HOME/ds4-bench-results/`, named
 timestamp makes every run a new file, so nothing is overwritten and reports
 sort chronologically.
 
+It opens with a one-line summary — generation, prefill and time-to-first-token
+deltas averaged across the frontiers — a link back to this repo, and a compact
+metadata line. Headings are kept at `h3`/`h4` and all raw data is collapsed
+behind a `<details>` block, so a report can be pasted straight into a pull
+request or issue comment without dominating the thread.
+
 It contains:
 
 - **What was compared** — branch and base names, commit hashes, subjects,
@@ -271,10 +277,8 @@ It contains:
 - **Interleave design** — the order, and whether it cancels linear and
   quadratic drift, with a warning if it does not.
 - **Results** — the table below, plus time to first token and repeatability.
-- **Run order** — every run with start, end, and exit code.
-- **Engine load** — the `ds4:` lines from the first run, so the model path and
-  memory plan are on the record.
-- **Raw CSV** — one block per run, collapsible.
+- **Raw data** — run timeline, engine load and per-run CSV, in one
+  collapsed `<details>` block.
 
 The results table shows **every run of each arm**, in the order they ran,
 with deltas comparing the arms' means:
